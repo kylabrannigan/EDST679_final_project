@@ -1,0 +1,95 @@
+---
+title: "Download and Clean NHANES Data"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+knitr::opts_knit$set(root.dir = '..')
+```
+
+## 1. Download and merge
+
+```{r}
+require(haven)
+require(dplyr)
+require(rio)
+
+dir.create('data/raw', recursive = TRUE, showWarnings = FALSE)
+
+files  <- c('DEMO','CFQ','SLQ','DPQ','BMX','DIQ','BPQ','SMQ','ALQ','PAQ')
+cycles <- data.frame(year = c('2011','2013'), suffix = c('G','H'))
+
+# function to get the data from the cdc website
+read_nhanes <- function(file, year, suffix){
+  fname <- paste0(file, '_', suffix, '.xpt')
+  path  <- file.path('data/raw', fname)
+  if(!file.exists(path)){
+    url <- paste0('https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/', year,
+                  '/DataFiles/', fname)
+    download.file(url, path, mode = 'wb')
+  }
+  read_xpt(path)
+}
+
+# empty list for the two cycles of data (2011-2012 and 2013-2014)
+nhanes <- vector('list', 2)
+
+# merge the 2011-2012 and 2013-2014 datasets into one
+for(i in 1:2){
+  d <- lapply(files, read_nhanes, year = cycles$year[i], suffix = cycles$suffix[i])
+  d <- Reduce(function(x, y) left_join(x, y, by = 'SEQN'), d)
+  d$cycle <- paste0(cycles$year[i], '-', as.numeric(cycles$year[i]) + 1)
+  nhanes[[i]] <- d
+}
+
+# making the list into a dataframe <3
+nhanes <- bind_rows(nhanes)
+```
+
+## 2. Recode and select variables
+
+```{r}
+# 'refused' (7, 77) and 'dont know' (9, 99) are recoded to missing.
+na_codes <- function(x, codes) ifelse(x %in% codes, NA, x)
+
+phq_items <- paste0('DPQ0', 1:9, '0')
+nhanes[, phq_items] <- lapply(nhanes[, phq_items], na_codes, codes = c(7, 9))
+
+# a lot of the survey questions are yes/no responses so this helps recode them
+yes_no <- function(x) ifelse(x == 1, 1, ifelse(x == 2, 0, NA))
+
+cog <- nhanes |>
+  filter(RIDAGEYR >= 60, !is.na(CFDCSR)) |>
+  # changing the column names to actually make sense
+  transmute(
+    id = SEQN,
+    delayed_recall = CFDCSR,
+    sleep_hours = na_codes(SLD010H, c(77, 99)),
+    trouble_sleeping = yes_no(SLQ050),
+    sleep_disorder = yes_no(SLQ060),
+    age = RIDAGEYR,
+    gender = ifelse(RIAGENDR == 1, 'Male', 'Female'),
+    race = recode(RIDRETH3, `1` = 'Mexican American', `2` = 'Other Hispanic', `3` = 'NH White', 
+                  `4` = 'NH Black', `6` = 'NH Asian', `7` = 'Other/Multi'),
+    education = na_codes(DMDEDUC2, c(7, 9)),
+    poverty_ratio = INDFMPIR,
+    depression = rowSums(across(all_of(phq_items))),
+    bmi = BMXBMI,
+    diabetes = ifelse(DIQ010 %in% c(1, 3), 1, ifelse(DIQ010 == 2, 0, NA)),
+    high_bp = yes_no(BPQ020),
+    smoker_ever = yes_no(SMQ020),
+    alcohol_12plus = yes_no(ALQ101),
+    vigorous_activity = yes_no(PAQ650),
+    moderate_activity = yes_no(PAQ665),
+    cycle = cycle
+  )
+
+dim(cog)
+```
+
+## 3. Save
+
+```{r}
+export(cog, 'data/nhanes_cognition.csv', row.names = FALSE)
+```
