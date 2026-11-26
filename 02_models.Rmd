@@ -1,0 +1,276 @@
+---
+title: "Predicting Delayed Recall: Linear, Ridge, and Lasso Regression"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+knitr::opts_knit$set(root.dir = '..')
+```
+
+```{r}
+require(dplyr)
+require(ggplot2)
+require(recipes)
+require(caret)
+require(glmnet)
+require(rio)
+
+dir.create('output', showWarnings = FALSE)
+dir.create('figures', showWarnings = FALSE)
+
+cog <- import('data/nhanes_cognition.csv', header = TRUE)
+
+dim(cog)
+```
+
+## 1. Indicating variable types so I can group them later
+
+```{r}
+outcome <- c('delayed_recall')
+
+id <- c('id')
+
+categorical <- c('trouble_sleeping','sleep_disorder','gender','race',
+                 'diabetes','high_bp','smoker_ever','alcohol_12plus',
+                 'vigorous_activity','moderate_activity','cycle')
+
+numeric <- c('sleep_hours','age','education','poverty_ratio','depression','bmi')
+
+for(i in categorical){
+  cog[,i] <- as.factor(cog[,i])
+}
+```
+
+## 2. Handling missing data and calculating descriptives
+
+```{r}
+missing_data <- data.frame(missing_datapercent = round(colMeans(is.na(cog))*100, 1))
+missing_data
+
+export(missing_data, 'output/missingness.csv')
+```
+
+```{r}
+# numeric
+desc_numeric <- data.frame(
+  mean = sapply(cog[, c(outcome, numeric)], mean, na.rm = TRUE),
+  sd   = sapply(cog[, c(outcome, numeric)], sd, na.rm = TRUE),
+  min  = sapply(cog[, c(outcome, numeric)], min, na.rm = TRUE),
+  max  = sapply(cog[, c(outcome, numeric)], max, na.rm = TRUE))
+round(desc_numeric, 2)
+
+export(round(desc_numeric, 2), 'output/descriptives_numeric.csv')
+
+# categorical
+desc_categorical <- do.call(rbind, lapply(categorical, function(v){
+  tab <- table(cog[, v], useNA = 'ifany')
+  data.frame(variable = v, level = names(tab), n = as.numeric(tab),
+             percent = round(100*as.numeric(tab)/nrow(cog), 1))
+}))
+desc_categorical
+
+export(desc_categorical, 'output/descriptives_categorical.csv', row.names = FALSE)
+```
+
+## 3. Making the blueprint
+
+```{r}
+blueprint <- recipe(x = cog,
+                    vars = c(id, outcome, categorical, numeric),
+                    roles = c('id', 'outcome', rep('predictor', 17))) |>
+  step_indicate_na(all_of(categorical), all_of(numeric)) |>
+  step_zv(all_numeric()) |>
+  step_impute_mean(all_of(numeric)) |>
+  step_impute_mode(all_of(categorical)) |>
+  step_poly(all_of(numeric), degree = 2) |> # relationship btwn sleep and cog perf is usually an inverted-U so this gives us that shape
+  step_normalize(paste0(numeric,'_poly_1'), paste0(numeric,'_poly_2')) |> # standardizes each of the polynomial columns
+  step_dummy(all_of(categorical), one_hot = TRUE) # gives each category its own indicator variable, still not entirely sure how/why this works but it does!
+
+blueprint
+```
+
+## 4. Making the train/test split
+
+```{r}
+set.seed(03022000)
+
+loc <- sample(1:nrow(cog), round(nrow(cog) * 0.8))
+cog_train <- cog[loc, ]
+cog_test <- cog[-loc, ]
+
+dim(cog_train)
+dim(cog_test)
+```
+
+## 5. Setting up the CV
+
+```{r}
+cog_train <- cog_train[sample(nrow(cog_train)),]
+
+folds <- cut(seq(1, nrow(cog_train)), breaks = 10, labels = FALSE)
+
+my_indices <- vector('list', 10)
+for(i in 1:10){
+  my_indices[[i]] <- which(folds != i)
+}
+
+cv <- trainControl(method = "cv", index = my_indices)
+
+eval_reg <- function(pred, obs){
+  c(Rsquare = cor(obs, pred)^2,
+    MAE = mean(abs(obs - pred)),
+    RMSE = sqrt(mean((obs - pred)^2)))
+}
+```
+
+## 6. Basic linear regression
+
+```{r}
+caret_lm <- caret::train(blueprint, data = cog_train, method = "lm", trControl = cv)
+
+caret_lm$results
+```
+
+## 7. Linear regression w/ ridge penalty
+
+```{r}
+grid <- data.frame(alpha = 0, lambda = 10^seq(-3, 1, length.out = 100)) # 0.001 to 10 bc who knows what we will need
+
+ridge <- caret::train(blueprint,
+                      data = cog_train,
+                      method = "glmnet",
+                      trControl = cv,
+                      tuneGrid = grid)
+
+ridge$bestTune
+```
+
+## 8. Linear regression w/ lasso penalty
+
+```{r}
+grid <- data.frame(alpha = 1, lambda = 10^seq(-4, 0, length.out = 100)) # 0.0001 to 1 bc assignment 2 showed a lower lambda was better for lasso reg
+
+lasso <- caret::train(blueprint,
+                      data = cog_train,
+                      method = "glmnet",
+                      trControl = cv,
+                      tuneGrid = grid)
+
+lasso$bestTune
+```
+
+## 9. Calculating test performance for each model
+
+```{r}
+perf <- data.frame(Model = c('Linear Regression', 'Ridge Regression', 'Lasso Regression'),
+                   rbind(eval_reg(predict(caret_lm, cog_test), cog_test$delayed_recall),
+                         eval_reg(predict(ridge, cog_test), cog_test$delayed_recall),
+                         eval_reg(predict(lasso, cog_test), cog_test$delayed_recall)))
+
+perf$lambda <- c(NA, ridge$bestTune$lambda, lasso$bestTune$lambda)
+
+perf[, -1] <- round(perf[, -1], 4)
+knitr::kable(perf)
+
+export(perf, 'output/model_performance.csv', row.names = FALSE)
+```
+
+Baseline: predicting the training mean for everyone.
+
+```{r}
+base_pred <- mean(cog_train$delayed_recall)
+baseline  <- c(MAE = mean(abs(cog_test$delayed_recall - base_pred)),
+               RMSE = sqrt(mean((cog_test$delayed_recall - base_pred)^2)))
+round(baseline, 3)
+
+final_name <- perf$Model[which.min(perf$RMSE)]
+final_mod  <- switch(final_name,
+                     'Linear Regression' = caret_lm,
+                     'Ridge Regression' = ridge,
+                     'Lasso Regression' = lasso)
+final_name
+```
+
+## 10. Most important predictors
+
+```{r}
+if(final_name == 'Linear Regression'){
+  coefs <- as.matrix(coef(final_mod$finalModel))
+} else {
+  coefs <- as.matrix(coef(final_mod$finalModel, final_mod$bestTune$lambda))
+}
+
+coefs <- coefs[rownames(coefs) != '(Intercept)', , drop = FALSE] # the empty set of commas means to select all cols
+coefs[is.na(coefs)] <- 0
+
+ind <- order(abs(coefs[,1]), decreasing = TRUE)
+
+top10 <- data.frame(predictor = rownames(coefs)[ind[1:10]],
+                    coefficient = round(coefs[ind[1:10], 1], 3),
+                    row.names = NULL)
+top10
+
+export(top10, 'output/top10_predictors.csv', row.names = FALSE)
+
+if(final_name == 'Lasso Regression'){
+  cat('Predictors kept by lasso:', sum(coefs[,1] != 0), 'of', nrow(coefs), '\n')
+}
+```
+
+## 11. Figures
+
+```{r}
+p1 <- cog |>
+  filter(!is.na(sleep_hours)) |>
+  mutate(sleep_cat = cut(sleep_hours, breaks = c(0, 5, 6, 7, 8, 9, 12),
+                         labels = c('<=5', '6', '7', '8', '9', '10+'))) |>
+  group_by(sleep_cat) |>
+  summarise(mean = mean(delayed_recall), se = sd(delayed_recall)/sqrt(n()), n = n()) |>
+  ggplot(aes(x = sleep_cat, y = mean)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = mean - 1.96 * se, ymax = mean + 1.96 * se), width = .2) +
+  xlab('Self-reported sleep (hours per night)') +
+  ylab('Mean delayed recall (0-10)') +
+  theme_bw()
+
+p1
+ggsave('figures/fig1_recall_by_sleep.png', p1, width = 6, height = 4)
+```
+
+```{r}
+p2 <- ggplot(lasso$results, aes(x = lambda, y = RMSE)) +
+  geom_line() +
+  geom_vline(xintercept = lasso$bestTune$lambda, lty = 2) +
+  scale_x_log10() +
+  xlab(expression(lambda ~ '(log scale)')) +
+  ylab('Cross-validated RMSE') +
+  theme_bw()
+
+p2
+ggsave('figures/fig2_lasso_tuning.png', p2, width = 6, height = 4)
+```
+
+```{r}
+p3 <- ggplot(data.frame(pred = predict(final_mod, cog_test), obs = cog_test$delayed_recall), aes(x = pred, y = obs)) +
+  geom_jitter(alpha = .3, height = .2, width = 0) +
+  geom_abline(lty = 2) +
+  xlab('Predicted delayed recall') +
+  ylab('Observed delayed recall') +
+  theme_bw()
+
+p3
+ggsave('figures/fig3_predicted_vs_observed.png', p3, width = 5, height = 5)
+```
+
+```{r}
+p4 <- ggplot(top10, aes(x = reorder(predictor, abs(coefficient)), y = coefficient)) +
+  geom_col() +
+  coord_flip() +
+  xlab('') +
+  ylab('Coefficient (change in words recalled)') +
+  theme_bw()
+
+p4
+ggsave('figures/fig4_top10_predictors.png', p4, width = 6, height = 4)
+```
